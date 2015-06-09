@@ -4,11 +4,14 @@ namespace Codeception\Module;
 
 use Codeception\Exception\TestRuntimeException;
 use Codeception\Lib\Connector\Guzzle;
+use Codeception\Lib\Connector\Guzzle as GuzzleConnector;
 use Codeception\Lib\InnerBrowser;
 use Codeception\Lib\Interfaces\MultiSession;
 use Codeception\Lib\Interfaces\Remote;
 use Codeception\TestCase;
 use GuzzleHttp\Client;
+use GuzzleHttp\Client as GuzzleClient;
+use GuzzleHttp\Psr7\Uri;
 
 /**
  * Uses [Guzzle](http://guzzlephp.org/) to interact with your application over CURL.
@@ -61,30 +64,35 @@ class PhpBrowser extends InnerBrowser implements Remote, MultiSession
 {
 
     protected $requiredFields = ['url'];
-    protected $config = ['verify' => false, 'expect' => false, 'timeout' => 30, 'curl' => [], 'refresh_max_interval' => 10];
+
+    protected $config = [
+        'verify' => false,
+        'expect' => false,
+        'timeout' => 30,
+        'curl' => [],
+        'refresh_max_interval' => 10,
+
+        // required defaults (not recommended to change)
+        'allow_redirects' => false,
+        'http_errors' => false,
+        'cookies' => true
+    ];
+
     protected $guzzleConfigFields = ['headers', 'auth', 'proxy', 'verify', 'cert', 'query', 'ssl_key', 'proxy', 'expect', 'version', 'cookies', 'timeout', 'connect_timeout'];
 
     /**
-     * @var \Codeception\Lib\Connector\Guzzle
+     * @var GuzzleConnector
      */
     public $client;
 
     /**
-     * @var \GuzzleHttp\Client
+     * @var GuzzleClient
      */
     public $guzzle;
 
     public function _initialize()
     {
-        $defaults = array_intersect_key($this->config, array_flip($this->guzzleConfigFields));
-        $defaults['config']['curl'] = $this->config['curl'];
-
-        foreach ($this->config['curl'] as $key => $val) {
-            if (defined($key)) {
-                $defaults['config']['curl'][constant($key)] = $val;
-            }
-        }
-        $this->guzzle = new Client(['base_url' => $this->config['url'], 'defaults' => $defaults]);
+        $this->client = new GuzzleConnector();
         $this->_initializeSession();
     }
 
@@ -212,10 +220,18 @@ class PhpBrowser extends InnerBrowser implements Remote, MultiSession
 
     public function _initializeSession()
     {
-        $this->client = new Guzzle();
-        $this->client->setClient($this->guzzle);
-        $this->client->setBaseUri($this->config['url']);
+        $defaults = array_intersect_key($this->config, array_flip($this->guzzleConfigFields));
+        $defaults['config']['curl'] = $this->config['curl'];
+
+        foreach ($this->config['curl'] as $key => $val) {
+            if (defined($key)) {
+                $defaults['config']['curl'][constant($key)] = $val;
+            }
+        }
+        $defaults['base_uri'] = $this->config['url'];
+        $this->guzzle = new GuzzleClient($defaults);
         $this->client->setRefreshMaxInterval($this->config['refresh_max_interval']);
+        $this->client->setClient($this->guzzle);
     }
 
     public function _backupSession()

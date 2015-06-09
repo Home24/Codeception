@@ -1,35 +1,28 @@
 <?php
-
 namespace Codeception\Lib\Connector;
 
-use Codeception\Exception\TestRuntime as TestRuntimeException;
 use Codeception\Exception\ConnectionException;
+use GuzzleHttp\Cookie\CookieJar;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Message\Response;
-use GuzzleHttp\Post\PostFile;
-use GuzzleHttp\Url;
+use GuzzleHttp\Psr7\Request as Psr7Request;
+use GuzzleHttp\Psr7\Response as Psr7Response;
+use GuzzleHttp\Psr7\Uri as Psr7Uri;
 use Symfony\Component\BrowserKit\Client;
 use Symfony\Component\BrowserKit\Request as BrowserKitRequest;
+use Symfony\Component\BrowserKit\Request;
 use Symfony\Component\BrowserKit\Response as BrowserKitResponse;
 
 class Guzzle extends Client
 {
-    protected $baseUri;
     protected $requestOptions = [
         'allow_redirects' => false,
         'headers'         => [],
     ];
     protected $refreshMaxInterval = 0;
 
-
     /** @var \GuzzleHttp\Client */
     protected $client;
-
-    public function setBaseUri($uri)
-    {
-        $this->baseUri = $uri;
-    }
 
     /**
      * Sets the maximum allowable timeout interval for a meta tag refresh to
@@ -47,7 +40,7 @@ class Guzzle extends Client
         $this->refreshMaxInterval = $seconds;
     }
 
-    public function setClient(\GuzzleHttp\Client $client)
+    public function setClient(\GuzzleHttp\Client &$client)
     {
         $this->client = $client;
     }
@@ -94,102 +87,100 @@ class Guzzle extends Client
      *
      * @return \Symfony\Component\BrowserKit\Response
      */
-    protected function createResponse(Response $response)
+    protected function createResponse(Psr7Response $response)
     {
-        $contentType = $response->getHeader('Content-Type');
+        $body = (string) $response->getBody();
+        $headers = $this->flattenHeaders($response->getHeaders());
 
+        $contentType = null;
+        if (isset($headers['Content-Type'])) {
+            $contentType = $headers['Content-Type'];
+        }
         if (!$contentType or strpos($contentType, 'charset=') === false) {
-            $body = $response->getBody(true);
             if (preg_match('/\<meta[^\>]+charset *= *["\']?([a-zA-Z\-0-9]+)/i', $body, $matches)) {
                 $contentType .= ';charset=' . $matches[1];
             }
-            $response->setHeader('Content-Type', $contentType);
+            $headers['Content-Type'] = $contentType;
         }
 
-        $headers = $response->getHeaders();
         $status = $response->getStatusCode();
         $matches = [];
 
         $matchesMeta = preg_match(
             '/\<meta[^\>]+http-equiv="refresh" content="(\d*)\s*;?\s*url=(.*?)"/i',
-            $response->getBody(true),
+            $body,
             $matches
         );
 
-        if (!$matchesMeta) {
+        if (!$matchesMeta and isset($headers['Refresh'])) {
             // match by header
             preg_match(
                 '~(\d*);?url=(.*)~',
-                (string)$response->getHeader('Refresh'),
+                (string) $headers['Refresh'],
                 $matches
             );
         }
 
         if ((!empty($matches)) && (empty($matches[1]) || $matches[1] < $this->refreshMaxInterval)) {
             $uri = $this->getAbsoluteUri($matches[2]);
-            $partsUri = parse_url($uri);
-            $partsCur = parse_url($this->getHistory()->current()->getUri());
-            foreach ($partsCur as $key => $part) {
-                if ($key === 'fragment') {
-                    continue;
-                }
-                if (!isset($partsUri[$key]) || $partsUri[$key] !== $part) {
-                    $status = 302;
-                    $headers['Location'] = $uri;
-                    break;
-                }
+            $currentUri = new Psr7Uri($this->getHistory()->current()->getUri());
+
+            if ($uri->withFragment('') != $currentUri->withFragment('')) {
+                $status = 302;
+                $headers['Location'] = (string) $uri;
             }
         }
 
-        return new BrowserKitResponse($response->getBody(), $status, $headers);
+        return new BrowserKitResponse($body, $status, $headers);
+    }
+
+    protected function flattenHeaders($headers)
+    {
+        return array_map(function ($header) {
+            return reset($header);
+        }, $headers);
+
     }
 
     public function getAbsoluteUri($uri)
     {
-        $build = parse_url($this->baseUri);
-        $uriParts = parse_url(preg_replace('~^/+(?=/)~', '', $uri));
-        
-        if ($build === false) {
-            throw new TestRuntimeException("URL '{$this->baseUri}' is malformed");
-        } elseif ($uriParts === false) {
-            throw new TestRuntimeException("URI '{$uri}' is malformed");
+        /** @var $baseUri Psr7Uri  **/
+        $baseUri = $this->client->getConfig('base_uri');
+        $resolvedUri = Psr7Uri::resolve($baseUri, $uri);
+        if ((strpos($uri, '/') !== 0) and (strpos($uri, '://') === false)) {
+            $pathUri = (new Psr7Uri($uri))->getPath();
+            $resolvedUri = $resolvedUri->withPath(ltrim($baseUri->getPath(). $pathUri, '/'));
         }
-        
-        foreach ($uriParts as $part => $value) {
-            if ($part === 'path' && strpos($value, '/') !== 0 && !empty($build[$part])) {
-                $build[$part] = rtrim($build[$part], '/') . '/' . $value;
-            } else {
-                $build[$part] = $value;
-            }
-        }
-        return \GuzzleHttp\Url::buildUrl($build);
+        return $resolvedUri;
     }
 
     protected function doRequest($request)
     {
         /** @var $request BrowserKitRequest  **/
-        $requestOptions = [
-            'body' => $this->extractBody($request),
-            'cookies' => $this->extractCookies($request),
-            'headers' => $this->extractHeaders($request)
-        ];
-
-        $requestOptions = array_merge_recursive($requestOptions, $this->requestOptions);
-
-        $guzzleRequest = $this->client->createRequest(
+        $guzzleRequest = new Psr7Request(
             $request->getMethod(),
             $request->getUri(),
-            $requestOptions
+            $this->extractHeaders($request),
+            $request->getContent()
         );
-        foreach ($this->extractFiles($request) as $postFile) {
-            $guzzleRequest->getBody()->addFile($postFile);
+
+        $options = $this->requestOptions;
+        $options['cookies'] = new CookieJar(false, $this->getCookieJar()->all());
+
+        $multipartData = $this->extractMultipartFormData($request);
+        if (!empty($multipartData)) {
+            $options['multipart'] = $multipartData;
         }
 
-        // Let BrowserKit handle redirects
+        $formData = $this->extractFormData($request);
+        if (empty($multipartData) and $formData) {
+            $options['form_params'] = $formData;
+        }
+
         try {
-            $response = $this->client->send($guzzleRequest);
+            $response = $this->client->send($guzzleRequest, $options);
         } catch (ConnectException $e) {
-            $url = $this->client->getBaseUrl();
+            $url = (string) $this->client->getConfig('base_uri');
             throw new ConnectionException("Couldn't connect to $url. Please check that web server is running");
         } catch (RequestException $e) {
             if (!$e->hasResponse()) {
@@ -205,7 +196,7 @@ class Guzzle extends Client
         $headers = [];
         $server = $request->getServer();
 
-        $uri = Url::fromString($request->getUri());
+        $uri = new Psr7Uri($request->getUri());
         $server['HTTP_HOST'] = $uri->getHost();
         $port = $uri->getPort();
         if ($port !== null && $port !== 443 && $port != 80) {
@@ -224,25 +215,53 @@ class Guzzle extends Client
         return $headers;
     }
 
-    protected function extractBody(BrowserKitRequest $request)
+    protected function extractFormData(BrowserKitRequest $request)
     {
-        if (in_array(strtoupper($request->getMethod()), array('GET','HEAD'))) {
+        if (!in_array(strtoupper($request->getMethod()), ['POST', 'PUT', 'PATCH'])) {
             return null;
         }
-        if ($request->getContent() !== null) {
-            return $request->getContent();
-        } else {
-            return $request->getParameters();
+
+        // guessing if it is a form data
+        $headers = $request->getServer();
+        if (isset($headers['HTTP_CONTENT_TYPE'])) {
+            // not a form
+            if ($headers['HTTP_CONTENT_TYPE'] !== 'application/x-www-form-urlencoded') {
+                return null;
+            }
         }
+        if ($request->getContent() !== null) {
+            return null;
+        }
+        return $request->getParameters();
     }
 
-    protected function extractFiles(BrowserKitRequest $request)
+    protected function extractMultipartFormData(Request $request)
     {
-        if (!in_array(strtoupper($request->getMethod()), ['POST', 'PUT'])) {
+        if (!in_array(strtoupper($request->getMethod()), ['POST', 'PUT', 'PATCH'])) {
             return [];
         }
 
-        return $this->mapFiles($request->getFiles());
+        $parts = $this->mapFiles($request->getFiles());
+        if (empty($parts)) {
+            return [];
+        }
+
+        foreach ($request->getParameters() as $k => $v) {
+            $parts = $this->formatMultipart($parts, $k, $v);
+        }
+        return $parts;
+    }
+
+    protected function formatMultipart($parts, $key, $value)
+    {
+        if (is_array($value)) {
+            foreach ($value as $subKey => $subValue) {
+                $parts = array_merge($this->formatMultipart([], $key."[$subKey]", $subValue), $parts);
+            }
+            return $parts;
+        }
+        $parts[] = ['name' => $key, 'contents' => $value];
+        return $parts;
     }
 
     protected function mapFiles($requestFiles, $arrayName = '')
@@ -259,21 +278,23 @@ class Guzzle extends Client
                         $handle = fopen($info['tmp_name'], 'r');
                         $filename = isset($info['name']) ? $info['name'] : null;
 
-                        $files[] = new PostFile($name, $handle, $filename);
+                        $files[] = [
+                            'name' => $name,
+                            'contents' => $handle,
+                            'filename' => $filename
+                        ];
                     }
                 } else {
                     $files = array_merge($files, $this->mapFiles($info, $name));
                 }
             } else {
-                $files[] = new PostFile($name, fopen($info, 'r'));
+                $files[] = [
+                    'name' => $name, 
+                    'contents' => fopen($info, 'r')
+                ];
             }
         }
 
         return $files;
-    }
-
-    protected function extractCookies(BrowserKitRequest $request)
-    {
-        return $this->getCookieJar()->allRawValues($request->getUri());
     }
 }
